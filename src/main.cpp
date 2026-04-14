@@ -1,5 +1,6 @@
 #include <SFML/Graphics.hpp>
 #include <iostream>
+#include <cmath>
 #include "../include/Chess_Board.h"
 #include "../include/Pawn.h"
 #include "../include/Rook.h"
@@ -13,6 +14,39 @@
 // Константы для размера доски и отступа
 const int SIZE = 8; // Размер шахматной доски 8x8
 const int BOARD_LEFT = 320; // Отступ для левого меню
+
+// Структура для анимации перемещения фигуры
+struct Animation {
+    sf::Vector2f startPos;
+    sf::Vector2f endPos;
+    sf::Vector2f currentPos;
+    std::string pieceKey;
+    std::pair<int, int> fromCoord;
+    std::pair<int, int> toCoord;
+    float progress;
+    float duration;
+    bool active;
+    
+    Animation(std::pair<int, int> from, std::pair<int, int> to, 
+              sf::Vector2f start, sf::Vector2f end, const std::string& key, float dur = 0.5f)
+        : fromCoord(from), toCoord(to), startPos(start), endPos(end), currentPos(start), 
+          pieceKey(key), progress(0.0f), duration(dur), active(true) {}
+    
+    void update(float dt) {
+        if (!active) return;
+        
+        progress += dt / duration;
+        if (progress >= 1.0f) {
+            progress = 1.0f;
+            active = false;
+        }
+        
+        // Плавное движение с ease-out
+        float t = progress;
+        t = 1.0f - (1.0f - t) * (1.0f - t); // ease-out quadratic
+        currentPos = startPos + (endPos - startPos) * t;
+    }
+};
 
 // Функция преобразования координат доски в экранные координаты
 sf::Vector2f toScreenCoords(std::pair<int,int> pos, float cellW, float cellH, float boardOffsetX, float boardOffsetY) {
@@ -109,6 +143,10 @@ int main() {
     std::pair<int,int> pendingTo{-1,-1}; // Клетка куда планируется ход
     std::string answerStr; // Строка для ввода ответа
 
+    // Анимации
+    std::vector<Animation> animations;
+    sf::Clock animationClock;
+
     // Функция получения цвета дракона по уровню ИИ
     auto getDragonColor = [](int level) -> std::string {
         switch(level) {
@@ -127,6 +165,40 @@ int main() {
         return "win"; // Дракон выиграл
     };
 
+    // Функция получения позиции короля для текущего хода
+    auto getKingPosition = [&](bool forWhite) -> std::pair<int, int> {
+        for (const auto& [pos, piece] : board.board) {
+            if (dynamic_cast<King*>(piece.get()) && piece->collor == forWhite) {
+                return pos;
+            }
+        }
+        return {-1, -1};
+    };
+
+    // Функция проверки шаха
+    auto isKingInCheck = [&](bool forWhite) -> bool {
+        return board.isCheck(forWhite);
+    };
+
+    // Функция добавления анимации перемещения
+    auto addMoveAnimation = [&](std::pair<int, int> from, std::pair<int, int> to, 
+                               float cellW, float cellH, float offX, float offY, 
+                               const std::string& pieceKey) {
+        sf::Vector2f startPos = toScreenCoords(from, cellW, cellH, offX, offY);
+        sf::Vector2f endPos = toScreenCoords(to, cellW, cellH, offX, offY);
+        animations.emplace_back(from, to, startPos, endPos, pieceKey, 0.5f);
+    };
+
+    // Функция проверки, находится ли клетка в процессе анимации
+    auto isCellAnimating = [&](std::pair<int, int> coord) -> bool {
+        for (const auto& anim : animations) {
+            if ((anim.fromCoord == coord || anim.toCoord == coord) && anim.active) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     // Функция сброса игры в начальное состояние
     auto resetGame = [&]() {
         board.setupBoard(); // Перерасстановка фигур
@@ -140,11 +212,26 @@ int main() {
         pendingFrom = {-1,-1}; // Сброс отложенных ходов
         pendingTo = {-1,-1};
         answerStr.clear(); // Очистка строки ответа
+        animations.clear(); // Очистка анимаций
         ai = DragonAI(!playerIsWhite, aiLevel); // Переинициализация ИИ
     };
 
     // Главный игровой цикл
     while (window.isOpen()) {
+        float dt = animationClock.restart().asSeconds();
+        
+        // Обновление анимаций
+        for (auto& anim : animations) {
+            anim.update(dt);
+        }
+        
+        // Удаление завершенных анимаций
+        animations.erase(
+            std::remove_if(animations.begin(), animations.end(),
+                [](const Animation& anim) { return !anim.active; }),
+            animations.end()
+        );
+
         sf::Event event;
         // Обработка всех событий в очереди
         while (window.pollEvent(event)) {
@@ -207,16 +294,17 @@ int main() {
                         std::pair<int,int> pos{x,y};
 
                         if (selected.first == -1) {
-                            // Выбор фигуры
+                            // Выбор фигуры (первый клик)
                             Chess_Piece* piece = board.getPiece(pos);
                             if (piece && piece->collor == whiteTurn) {
                                 selected = pos; // Запоминаем выбранную клетку
                                 legalMoves = board.getLegalMoves(selected); // Получаем допустимые ходы
                             }
                         } else {
-                            // Попытка сделать ход
+                            // Второй клик - попытка сделать ход или переключить выбор
                             bool found = false;
                             for (auto &m : legalMoves) if (m == pos) { found = true; break; }
+                            
                             if (found) {
                                 // Создание математической задачи для хода
                                 currentProblem = MathProblem(mathDiff, moveCount);
@@ -224,8 +312,23 @@ int main() {
                                 pendingFrom = selected; // Запоминаем планируемый ход
                                 pendingTo = pos;
                                 answerStr.clear(); // Очищаем предыдущий ответ
+                            } else {
+                                // Если кликнули на другую свою фигуру - переключаем выбор
+                                Chess_Piece* piece = board.getPiece(pos);
+                                if (piece && piece->collor == whiteTurn) {
+                                    selected = pos; // Выбираем новую фигуру
+                                    legalMoves = board.getLegalMoves(selected); // Получаем новые допустимые ходы
+                                } else {
+                                    // Если кликнули на пустую клетку или чужую фигуру - сбрасываем выбор
+                                    selected = {-1,-1};
+                                    legalMoves.clear();
+                                }
                             }
                         }
+                    } else {
+                        // Клик вне доски - сбрасываем выбор
+                        selected = {-1,-1};
+                        legalMoves.clear();
                     }
                 }
             }
@@ -247,8 +350,34 @@ int main() {
                         }
                     }
                     
+                    // Получаем информацию о фигуре для анимации
+                    Chess_Piece* movingPiece = board.getPiece(pendingFrom);
+                    std::string pieceKey = "";
+                    if (movingPiece) {
+                        std::string color = movingPiece->collor ? "white_" : "black_";
+                        if (dynamic_cast<Pawn*>(movingPiece)) pieceKey = color + "pawn";
+                        else if (dynamic_cast<Rook*>(movingPiece)) pieceKey = color + "rook";
+                        else if (dynamic_cast<Horse*>(movingPiece)) pieceKey = color + "horse";
+                        else if (dynamic_cast<Bishop*>(movingPiece)) pieceKey = color + "bishop";
+                        else if (dynamic_cast<Queen*>(movingPiece)) pieceKey = color + "queen";
+                        else if (dynamic_cast<King*>(movingPiece)) pieceKey = color + "king";
+                    }
+                    
                     // Выполнение хода
                     if (board.movePiece(pendingFrom, finalTo)) {
+                        // Добавляем анимацию если есть информация о фигуре
+                        if (!pieceKey.empty()) {
+                            float availW = static_cast<float>(window.getSize().x - BOARD_LEFT);
+                            float availH = static_cast<float>(window.getSize().y);
+                            float boardSize = std::min(availH, availW);
+                            float cellW = boardSize / SIZE;
+                            float cellH = cellW;
+                            float offX = static_cast<float>(BOARD_LEFT) + (availW - boardSize) * 0.5f;
+                            float offY = (availH - boardSize) * 0.5f;
+                            
+                            addMoveAnimation(pendingFrom, finalTo, cellW, cellH, offX, offY, pieceKey);
+                        }
+                        
                         whiteTurn = !whiteTurn; // Смена хода
                         moveCount++; // Увеличение счетчика ходов
                         
@@ -285,8 +414,9 @@ int main() {
                     if (event.key.code == sf::Keyboard::Enter || event.key.code == sf::Keyboard::Return) 
                         submit(); // Отправка по Enter
                     if (event.key.code == sf::Keyboard::Escape) { 
-                        // Отмена ввода
+                        // Отмена ввода - возврат к выбору фигуры
                         awaitingAnswer = false; 
+                        // Не сбрасываем selected и legalMoves, чтобы можно было выбрать другой ход
                         pendingFrom = pendingTo = {-1,-1}; 
                         answerStr.clear(); 
                     }
@@ -295,10 +425,37 @@ int main() {
         }
 
         // Ход ИИ (если игра активна и не ожидается ответ, и ход ИИ)
-        if (!gameOver && !awaitingAnswer && whiteTurn != playerIsWhite) {
+        if (!gameOver && !awaitingAnswer && whiteTurn != playerIsWhite && animations.empty()) {
             AIMove mv = ai.chooseMove(board); // Выбор хода ИИ
             if (mv.from.first != -1) {
-                board.movePiece(mv.from, mv.to); // Выполнение хода
+                // Получаем информацию о фигуре для анимации
+                Chess_Piece* movingPiece = board.getPiece(mv.from);
+                std::string pieceKey = "";
+                if (movingPiece) {
+                    std::string color = movingPiece->collor ? "white_" : "black_";
+                    if (dynamic_cast<Pawn*>(movingPiece)) pieceKey = color + "pawn";
+                    else if (dynamic_cast<Rook*>(movingPiece)) pieceKey = color + "rook";
+                    else if (dynamic_cast<Horse*>(movingPiece)) pieceKey = color + "horse";
+                    else if (dynamic_cast<Bishop*>(movingPiece)) pieceKey = color + "bishop";
+                    else if (dynamic_cast<Queen*>(movingPiece)) pieceKey = color + "queen";
+                    else if (dynamic_cast<King*>(movingPiece)) pieceKey = color + "king";
+                }
+                
+                // Выполнение хода
+                if (board.movePiece(mv.from, mv.to)) {
+                    // Добавляем анимацию если есть информация о фигуре
+                    if (!pieceKey.empty()) {
+                        float availW = static_cast<float>(window.getSize().x - BOARD_LEFT);
+                        float availH = static_cast<float>(window.getSize().y);
+                        float boardSize = std::min(availH, availW);
+                        float cellW = boardSize / SIZE;
+                        float cellH = cellW;
+                        float offX = static_cast<float>(BOARD_LEFT) + (availW - boardSize) * 0.5f;
+                        float offY = (availH - boardSize) * 0.5f;
+                        
+                        addMoveAnimation(mv.from, mv.to, cellW, cellH, offX, offY, pieceKey);
+                    }
+                }
             }
             whiteTurn = !whiteTurn; // Смена хода
             
@@ -405,6 +562,18 @@ int main() {
             window.draw(sel);
         }
 
+        // Подсветка короля при шахе
+        if (isKingInCheck(whiteTurn)) {
+            std::pair<int, int> kingPos = getKingPosition(whiteTurn);
+            if (kingPos.first != -1 && !isCellAnimating(kingPos)) {
+                sf::RectangleShape check(sf::Vector2f(cellW, cellH));
+                auto kingScreenPos = toScreenCoords(kingPos, cellW, cellH, offX, offY);
+                check.setPosition(kingScreenPos.x, kingScreenPos.y);
+                check.setFillColor(sf::Color(255, 0, 0, 100)); // Полупрозрачный красный
+                window.draw(check);
+            }
+        }
+
         // Отрисовка допустимых ходов (зеленые кружки)
         for (auto &m : legalMoves) {
             float r = std::min(cellW, cellH) / 6.f;
@@ -417,6 +586,11 @@ int main() {
 
         // Отрисовка шахматных фигур с использованием единой текстуры
         for (auto &[coord, piece] : board.board) {
+            // Пропускаем фигуры, которые в процессе анимации
+            if (isCellAnimating(coord)) {
+                continue;
+            }
+            
             std::string name;
             // Определение типа фигуры через dynamic_cast
             if (dynamic_cast<Pawn*>(piece.get())) name = "pawn";
@@ -435,6 +609,16 @@ int main() {
                 // Масштабирование и позиционирование спрайта
                 sprite.setScale(cellW / PIECE_WIDTH, cellH / PIECE_HEIGHT);
                 sprite.setPosition(toScreenCoords(coord, cellW, cellH, offX, offY));
+                window.draw(sprite);
+            }
+        }
+
+        // Отрисовка анимированных фигур поверх всех остальных
+        for (const auto& anim : animations) {
+            if (pieceSprites.find(anim.pieceKey) != pieceSprites.end()) {
+                sf::Sprite sprite = pieceSprites[anim.pieceKey];
+                sprite.setScale(cellW / PIECE_WIDTH, cellH / PIECE_HEIGHT);
+                sprite.setPosition(anim.currentPos);
                 window.draw(sprite);
             }
         }
